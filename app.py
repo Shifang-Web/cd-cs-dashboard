@@ -43,7 +43,8 @@ def load_default_data():
             temp_df['来源工作表'] = sheet
             all_dfs.append(temp_df)
         df = pd.concat(all_dfs, ignore_index=True)
-        df.columns = df.columns.str.strip()
+        # 去除列名前后的空格（含全角）
+        df.columns = df.columns.str.strip().str.replace('\u3000', '')
         return df
     except Exception as e:
         raise RuntimeError(f"本地文件 data.xlsx 读取失败，请检查文件是否存在。原始错误：{e}")
@@ -173,37 +174,72 @@ hr_xiaofang, n_city_xf, n_street_xf = get_category_high_risk_df("消防", filter
 hr_zhian, n_city_za, n_street_za = get_category_high_risk_df("治安", filtered_df, TAB_CONFIG['治安'])
 
 # ==========================================
-# 7. 【独立板块】天气预警
+# 7. 【独立板块】天气预警（带诊断）
 # ==========================================
 def build_city_representatives():
+    """返回 (城市坐标字典, 错误说明)"""
     all_hr = pd.concat([hr_fangxun, hr_xiaofang, hr_zhian], ignore_index=True)
     dim_col = COMMON_COLS['蝶城']
     lon_col = COMMON_COLS['经度']
     lat_col = COMMON_COLS['纬度']
 
-    if len(all_hr) == 0 or dim_col not in all_hr.columns or lon_col not in all_hr.columns:
-        return {}
+    if len(all_hr) == 0:
+        return {}, "三个板块均无高风险数据"
+
+    # 诊断 1：检查关键列是否存在
+    missing_cols = []
+    if dim_col not in all_hr.columns:
+        missing_cols.append(f"蝶城列（期望列名'{dim_col}'）")
+    if lon_col not in all_hr.columns:
+        missing_cols.append(f"经度列（期望列名'{lon_col}'）")
+    if lat_col not in all_hr.columns:
+        missing_cols.append(f"纬度列（期望列名'{lat_col}'）")
+
+    if missing_cols:
+        return {}, (
+            f"❌ 缺少以下列：{'、'.join(missing_cols)}\n\n"
+            f"📋 当前数据实际列名：{list(all_hr.columns)}\n\n"
+            f"💡 请检查部署到 Streamlit Cloud 的 data.xlsx 是否包含'经度'和'纬度'两列。"
+        )
 
     tmp = all_hr.copy()
     tmp['_city'] = tmp.apply(extract_city, axis=1)
     tmp[lon_col] = pd.to_numeric(tmp[lon_col], errors='coerce')
     tmp[lat_col] = pd.to_numeric(tmp[lat_col], errors='coerce')
-    tmp = tmp.dropna(subset=[lon_col, lat_col])
 
+    # 诊断 2：经纬度全部为空
+    before = len(tmp)
+    tmp = tmp.dropna(subset=[lon_col, lat_col])
+    after = len(tmp)
+
+    if after == 0:
+        return {}, (
+            f"❌ 经纬度数据全部为空或无法转为数字（原始 {before} 条）\n\n"
+            f"💡 请检查 data.xlsx 中'经度'和'纬度'两列是否有实际数值。"
+        )
+
+    # 诊断 3：城市识别全失败
     city_reps = {}
     for city, group in tmp.groupby('_city'):
         if city == "其他":
             continue
         first = group.iloc[0]
         city_reps[city] = (first[lat_col], first[lon_col])
-    return city_reps
+
+    if not city_reps:
+        return {}, (
+            f"❌ 所有项目的城市都无法识别（有效坐标 {after} 条）\n\n"
+            f"💡 请检查'蝶城'或'项目名称'列是否包含'成都'/'昆明'/'西昌'等关键词。"
+        )
+
+    return city_reps, None
 
 def render_global_weather_section():
     st.subheader("🌦️ 天气预警（全区域）")
 
-    city_reps = build_city_representatives()
-    if not city_reps:
-        st.info("💡 暂无有效的城市坐标数据，无法查询天气预警。")
+    city_reps, err = build_city_representatives()
+    if err:
+        st.warning(err)
         return set()
 
     alert_cities = set()
@@ -342,10 +378,6 @@ def render_city_map(city_name, city_df, category_name, config, alert_cities):
 # 9. 板块渲染函数
 # ==========================================
 def render_category_dashboard(category_name, high_risk_df, n_city, n_street, config, alert_cities, show_xichang=True):
-    """
-    渲染单个风险板块
-    show_xichang: 是否显示西昌地图（消防板块传 False）
-    """
     risk_col = config['risk']
     point_col = config['point']
     desc_col = config['desc']
@@ -355,7 +387,6 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
         st.success(f"🎉 {category_name} 当前暂无高风险数据！")
         return pd.DataFrame()
 
-    # ================= 1. 指标卡片 =================
     col1, col2, col3 = st.columns(3)
     col1.metric("🚨 高风险项目总数", len(high_risk_df))
     col2.metric("🚨 高风险蝶城项目数", n_city)
@@ -363,7 +394,6 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
 
     st.markdown("---")
 
-    # ================= 2. 双城市地图（左成都、右昆明） =================
     st.subheader(f"🗺️ {category_name} - 高风险项目地图分布")
 
     hr_copy = high_risk_df.copy()
@@ -379,12 +409,10 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
     with right_col:
         render_city_map("昆明", kunming_df, category_name, config, alert_cities)
 
-    # 西昌地图（根据 show_xichang 参数决定是否显示）
     if show_xichang and len(xichang_df) > 0:
         st.markdown(f"**🗺️ {category_name} - 西昌 高风险项目分布**")
         render_city_map("西昌", xichang_df, category_name, config, alert_cities)
 
-    # ================= 3. 高风险点位详细清单 =================
     st.markdown("---")
     st.subheader(f"🚨 {category_name} - 高风险点位详细清单")
 
@@ -428,12 +456,12 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
     return detail_df
 
 # ==========================================
-# 10. 主界面：三个风险板块
+# 10. 主界面
 # ==========================================
 with st.expander("🌊 防汛板块", expanded=True):
     detail_fangxun = render_category_dashboard(
         "防汛", hr_fangxun, n_city_fx, n_street_fx, TAB_CONFIG['防汛'], alert_cities_global,
-        show_xichang=True  # 防汛板块显示西昌
+        show_xichang=True
     )
 
 st.markdown("---")
@@ -441,7 +469,7 @@ st.markdown("---")
 with st.expander("🔥 消防板块", expanded=True):
     detail_xiaofang = render_category_dashboard(
         "消防", hr_xiaofang, n_city_xf, n_street_xf, TAB_CONFIG['消防'], alert_cities_global,
-        show_xichang=False  # 消防板块不显示西昌
+        show_xichang=False
     )
 
 st.markdown("---")
@@ -449,7 +477,7 @@ st.markdown("---")
 with st.expander("🚓 治安板块", expanded=True):
     detail_zhian = render_category_dashboard(
         "治安", hr_zhian, n_city_za, n_street_za, TAB_CONFIG['治安'], alert_cities_global,
-        show_xichang=True  # 治安板块显示西昌
+        show_xichang=True
     )
 
 # ==========================================
