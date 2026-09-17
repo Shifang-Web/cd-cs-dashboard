@@ -30,6 +30,9 @@ def get_secret(key, default):
 QWEATHER_KEY = get_secret("key", "dc8db5bb8e1049d6addb14bef20e2bb5")
 QWEATHER_API_HOST = get_secret("host", "https://nd5khxx2t4.re.qweatherapi.com/weatheralert/v1/current")
 
+# 从预警Host中提取基础域名（去掉 /weatheralert/... 部分）
+QWEATHER_BASE = QWEATHER_API_HOST.rsplit('/weatheralert', 1)[0]
+
 # ==========================================
 # 3. 数据加载（带缓存）
 # ==========================================
@@ -43,7 +46,6 @@ def load_default_data():
             temp_df['来源工作表'] = sheet
             all_dfs.append(temp_df)
         df = pd.concat(all_dfs, ignore_index=True)
-        # 去除列名前后的空格（含全角）
         df.columns = df.columns.str.strip().str.replace('\u3000', '')
         return df
     except Exception as e:
@@ -93,6 +95,21 @@ CITY_MAP_CONFIG = {
     '西昌': {"center": {"lat": 27.89, "lon": 102.26}, "zoom": 10},
 }
 
+# 天气图标映射（根据天气文本关键词匹配emoji）
+def weather_emoji(text):
+    if not text:
+        return '🌡️'
+    if '雷' in text: return '⛈️'
+    if '暴' in text: return '🌧️'
+    if '大雨' in text or '中雨' in text: return '🌧️'
+    if '雨' in text: return '🌦️'
+    if '雪' in text: return '❄️'
+    if '雾' in text or '霾' in text: return '🌫️'
+    if '阴' in text: return '☁️'
+    if '多云' in text: return '⛅'
+    if '晴' in text: return '☀️'
+    return '🌡️'
+
 # ==========================================
 # 5. 工具函数
 # ==========================================
@@ -138,6 +155,40 @@ def get_weather_warnings_cached(lat, lon):
     except Exception as e:
         return None, f"请求失败：{e}"
 
+@st.cache_data(ttl=600)  # 天气缓存10分钟
+def get_current_weather_cached(lat, lon):
+    """获取当前天气。尝试新版 v1 和旧版 v7 两种路径"""
+    candidates = [
+        # 新版路径（与预警同族）
+        (f"{QWEATHER_BASE}/weather/v1/now/{lat}/{lon}", {}),
+        # 旧版路径
+        (f"{QWEATHER_BASE}/v7/weather/now", {'location': f'{lon},{lat}'}),
+    ]
+
+    for url, extra_params in candidates:
+        params = {'key': QWEATHER_KEY, 'lang': 'zh'}
+        params.update(extra_params)
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            data = resp.json()
+
+            if 'error' in data:
+                continue  # 尝试下一个端点
+            code = data.get('code')
+            if code not in (None, '200'):
+                continue
+
+            # 兼容不同返回结构
+            now = data.get('now') or data.get('current') or data.get('weather')
+            if not now or 'temp' not in now:
+                continue
+
+            return now, None
+        except Exception:
+            continue
+
+    return None, "无法获取天气数据（端点可能已变更）"
+
 # ==========================================
 # 6. 板块数据处理
 # ==========================================
@@ -174,7 +225,7 @@ hr_xiaofang, n_city_xf, n_street_xf = get_category_high_risk_df("消防", filter
 hr_zhian, n_city_za, n_street_za = get_category_high_risk_df("治安", filtered_df, TAB_CONFIG['治安'])
 
 # ==========================================
-# 7. 【独立板块】天气预警（带诊断）
+# 7. 城市代表坐标（供天气、预警共用）
 # ==========================================
 def build_city_representatives():
     """返回 (城市坐标字典, 错误说明)"""
@@ -186,7 +237,6 @@ def build_city_representatives():
     if len(all_hr) == 0:
         return {}, "三个板块均无高风险数据"
 
-    # 诊断 1：检查关键列是否存在
     missing_cols = []
     if dim_col not in all_hr.columns:
         missing_cols.append(f"蝶城列（期望列名'{dim_col}'）")
@@ -198,8 +248,7 @@ def build_city_representatives():
     if missing_cols:
         return {}, (
             f"❌ 缺少以下列：{'、'.join(missing_cols)}\n\n"
-            f"📋 当前数据实际列名：{list(all_hr.columns)}\n\n"
-            f"💡 请检查部署到 Streamlit Cloud 的 data.xlsx 是否包含'经度'和'纬度'两列。"
+            f"📋 当前数据实际列名：{list(all_hr.columns)}"
         )
 
     tmp = all_hr.copy()
@@ -207,18 +256,10 @@ def build_city_representatives():
     tmp[lon_col] = pd.to_numeric(tmp[lon_col], errors='coerce')
     tmp[lat_col] = pd.to_numeric(tmp[lat_col], errors='coerce')
 
-    # 诊断 2：经纬度全部为空
-    before = len(tmp)
     tmp = tmp.dropna(subset=[lon_col, lat_col])
-    after = len(tmp)
+    if len(tmp) == 0:
+        return {}, "❌ 经纬度数据全部为空或无法转为数字"
 
-    if after == 0:
-        return {}, (
-            f"❌ 经纬度数据全部为空或无法转为数字（原始 {before} 条）\n\n"
-            f"💡 请检查 data.xlsx 中'经度'和'纬度'两列是否有实际数值。"
-        )
-
-    # 诊断 3：城市识别全失败
     city_reps = {}
     for city, group in tmp.groupby('_city'):
         if city == "其他":
@@ -227,13 +268,13 @@ def build_city_representatives():
         city_reps[city] = (first[lat_col], first[lon_col])
 
     if not city_reps:
-        return {}, (
-            f"❌ 所有项目的城市都无法识别（有效坐标 {after} 条）\n\n"
-            f"💡 请检查'蝶城'或'项目名称'列是否包含'成都'/'昆明'/'西昌'等关键词。"
-        )
+        return {}, "❌ 所有项目的城市都无法识别"
 
     return city_reps, None
 
+# ==========================================
+# 8. 【独立板块】天气预警
+# ==========================================
 def render_global_weather_section():
     st.subheader("🌦️ 天气预警（全区域）")
 
@@ -294,13 +335,80 @@ def render_global_weather_section():
 
     return alert_cities
 
+# ==========================================
+# 9. 【独立板块】当日城市天气
+# ==========================================
+def render_global_weather_now_section():
+    st.subheader("🌤️ 当日城市天气")
+
+    city_reps, err = build_city_representatives()
+    if err:
+        st.info(f"💡 {err}")
+        return
+
+    cols = st.columns(min(len(city_reps), 3))
+
+    for i, (city, (lat, lon)) in enumerate(sorted(city_reps.items())):
+        weather, error = get_current_weather_cached(lat, lon)
+        with cols[i % 3]:
+            if error is not None or weather is None:
+                st.warning(f"⚠️ {city} 天气获取失败：{error or '未知'}")
+                continue
+
+            temp = weather.get('temp', '--')
+            feels = weather.get('feelsLike', '--')
+            text = weather.get('text', '--')
+            humidity = weather.get('humidity', '--')
+            wind_dir = weather.get('windDir', '--')
+            wind_scale = weather.get('windScale', '--')
+            obs_time = weather.get('obsTime', '')
+            icon = weather_emoji(text)
+
+            # 显示时只保留时分
+            time_str = obs_time[11:16] if len(obs_time) >= 16 else obs_time
+
+            st.markdown(f"""
+                <div style="
+                    background: linear-gradient(135deg, #E8F4FD 0%, #F7F9FC 100%);
+                    border: 1px solid #D6E4F0;
+                    border-radius: 10px;
+                    padding: 16px 18px;
+                    margin-bottom: 10px;
+                ">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div style="font-size: 16px; font-weight: 600; color: #2C5282;">🏙️ {city}</div>
+                        <div style="font-size: 32px;">{icon}</div>
+                    </div>
+                    <div style="font-size: 28px; font-weight: 700; color: #1A365D; margin: 6px 0;">
+                        {temp}<span style="font-size: 16px; font-weight: 400;">°C</span>
+                        <span style="font-size: 14px; font-weight: 400; color: #4A5568; margin-left: 8px;">{text}</span>
+                    </div>
+                    <div style="font-size: 12px; color: #4A5568; margin-top: 6px; line-height: 1.8;">
+                        🌡️ 体感温度：{feels}°C<br/>
+                        💧 相对湿度：{humidity}%<br/>
+                        🌬️ 风向风力：{wind_dir} {wind_scale}级
+                    </div>
+                    <div style="font-size: 11px; color: #A0AEC0; margin-top: 8px; text-align: right;">
+                        更新时间：{time_str}
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+# ==========================================
+# 10. 渲染两个独立板块
+# ==========================================
 with st.expander("🌦️ 天气预警板块", expanded=True):
     alert_cities_global = render_global_weather_section()
 
 st.markdown("---")
 
+with st.expander("🌤️ 当日城市天气板块", expanded=True):
+    render_global_weather_now_section()
+
+st.markdown("---")
+
 # ==========================================
-# 8. 单城市地图渲染函数
+# 11. 单城市地图渲染函数
 # ==========================================
 def render_city_map(city_name, city_df, category_name, config, alert_cities):
     risk_col = config['risk']
@@ -375,7 +483,7 @@ def render_city_map(city_name, city_df, category_name, config, alert_cities):
         st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================
-# 9. 板块渲染函数
+# 12. 板块渲染函数
 # ==========================================
 def render_category_dashboard(category_name, high_risk_df, n_city, n_street, config, alert_cities, show_xichang=True):
     risk_col = config['risk']
@@ -456,7 +564,7 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
     return detail_df
 
 # ==========================================
-# 10. 主界面
+# 13. 主界面：三个风险板块
 # ==========================================
 with st.expander("🌊 防汛板块", expanded=True):
     detail_fangxun = render_category_dashboard(
@@ -481,7 +589,7 @@ with st.expander("🚓 治安板块", expanded=True):
     )
 
 # ==========================================
-# 11. 一键导出完整报告
+# 14. 一键导出完整报告
 # ==========================================
 st.markdown("---")
 st.subheader("📤 导出完整风险报告")
@@ -513,7 +621,7 @@ st.download_button(
 )
 
 # ==========================================
-# 12. 原始数据展开查看
+# 15. 原始数据展开查看
 # ==========================================
 st.markdown("---")
 with st.expander("点击查看原始数据表格"):
