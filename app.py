@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import io
 import os
 import datetime
+import numpy as np
 
 # ==========================================
 # 1. 页面基础设置
@@ -29,12 +31,10 @@ def get_secret(key, default):
 
 QWEATHER_KEY = get_secret("key", "dc8db5bb8e1049d6addb14bef20e2bb5")
 QWEATHER_API_HOST = get_secret("host", "https://nd5khxx2t4.re.qweatherapi.com/weatheralert/v1/current")
-
-# 从预警Host中提取基础域名（去掉 /weatheralert/... 部分）
 QWEATHER_BASE = QWEATHER_API_HOST.rsplit('/weatheralert', 1)[0]
 
 # ==========================================
-# 3. 数据加载（带缓存）
+# 3. 数据加载
 # ==========================================
 @st.cache_data(ttl=600)
 def load_default_data():
@@ -95,10 +95,8 @@ CITY_MAP_CONFIG = {
     '西昌': {"center": {"lat": 27.89, "lon": 102.26}, "zoom": 10},
 }
 
-# 天气图标映射（根据天气文本关键词匹配emoji）
 def weather_emoji(text):
-    if not text:
-        return '🌡️'
+    if not text: return '🌡️'
     if '雷' in text: return '⛈️'
     if '暴' in text: return '🌧️'
     if '大雨' in text or '中雨' in text: return '🌧️'
@@ -141,7 +139,6 @@ def get_weather_warnings_cached(lat, lon):
     try:
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
-
         if 'error' in data:
             err = data['error']
             return None, f"API错误：{err.get('title', '未知')} - {err.get('detail', '')}"
@@ -155,38 +152,29 @@ def get_weather_warnings_cached(lat, lon):
     except Exception as e:
         return None, f"请求失败：{e}"
 
-@st.cache_data(ttl=600)  # 天气缓存10分钟
+@st.cache_data(ttl=600)
 def get_current_weather_cached(lat, lon):
-    """获取当前天气。尝试新版 v1 和旧版 v7 两种路径"""
     candidates = [
-        # 新版路径（与预警同族）
         (f"{QWEATHER_BASE}/weather/v1/now/{lat}/{lon}", {}),
-        # 旧版路径
         (f"{QWEATHER_BASE}/v7/weather/now", {'location': f'{lon},{lat}'}),
     ]
-
     for url, extra_params in candidates:
         params = {'key': QWEATHER_KEY, 'lang': 'zh'}
         params.update(extra_params)
         try:
             resp = requests.get(url, params=params, timeout=10)
             data = resp.json()
-
             if 'error' in data:
-                continue  # 尝试下一个端点
+                continue
             code = data.get('code')
             if code not in (None, '200'):
                 continue
-
-            # 兼容不同返回结构
             now = data.get('now') or data.get('current') or data.get('weather')
             if not now or 'temp' not in now:
                 continue
-
             return now, None
         except Exception:
             continue
-
     return None, "无法获取天气数据（端点可能已变更）"
 
 # ==========================================
@@ -195,21 +183,16 @@ def get_current_weather_cached(lat, lon):
 def get_category_high_risk_df(category_name, data_df, config):
     if CATEGORY_COL not in data_df.columns:
         return pd.DataFrame(), 0, 0
-
     category_df = data_df[data_df[CATEGORY_COL] == category_name].copy()
     if len(category_df) == 0:
         return pd.DataFrame(), 0, 0
-
     risk_col = config['risk']
     dim_col = COMMON_COLS['蝶城']
-
     if risk_col not in category_df.columns:
         return pd.DataFrame(), 0, 0
-
     high_risk_df = category_df[category_df[risk_col].astype(str).str.contains('高风险', na=False)].copy()
     if len(high_risk_df) == 0:
         return pd.DataFrame(), 0, 0
-
     if dim_col in high_risk_df.columns:
         is_street = high_risk_df[dim_col].astype(str).str.contains(STREET_KEYWORD, na=False)
         n_city = len(high_risk_df[~is_street])
@@ -217,7 +200,6 @@ def get_category_high_risk_df(category_name, data_df, config):
     else:
         n_city = len(high_risk_df)
         n_street = 0
-
     return high_risk_df, n_city, n_street
 
 hr_fangxun, n_city_fx, n_street_fx = get_category_high_risk_df("防汛", filtered_df, TAB_CONFIG['防汛'])
@@ -225,10 +207,9 @@ hr_xiaofang, n_city_xf, n_street_xf = get_category_high_risk_df("消防", filter
 hr_zhian, n_city_za, n_street_za = get_category_high_risk_df("治安", filtered_df, TAB_CONFIG['治安'])
 
 # ==========================================
-# 7. 城市代表坐标（供天气、预警共用）
+# 7. 城市代表坐标
 # ==========================================
 def build_city_representatives():
-    """返回 (城市坐标字典, 错误说明)"""
     all_hr = pd.concat([hr_fangxun, hr_xiaofang, hr_zhian], ignore_index=True)
     dim_col = COMMON_COLS['蝶城']
     lon_col = COMMON_COLS['经度']
@@ -255,7 +236,6 @@ def build_city_representatives():
     tmp['_city'] = tmp.apply(extract_city, axis=1)
     tmp[lon_col] = pd.to_numeric(tmp[lon_col], errors='coerce')
     tmp[lat_col] = pd.to_numeric(tmp[lat_col], errors='coerce')
-
     tmp = tmp.dropna(subset=[lon_col, lat_col])
     if len(tmp) == 0:
         return {}, "❌ 经纬度数据全部为空或无法转为数字"
@@ -266,18 +246,15 @@ def build_city_representatives():
             continue
         first = group.iloc[0]
         city_reps[city] = (first[lat_col], first[lon_col])
-
     if not city_reps:
         return {}, "❌ 所有项目的城市都无法识别"
-
     return city_reps, None
 
 # ==========================================
-# 8. 【独立板块】天气预警
+# 8. 天气预警板块
 # ==========================================
 def render_global_weather_section():
     st.subheader("🌦️ 天气预警（全区域）")
-
     city_reps, err = build_city_representatives()
     if err:
         st.warning(err)
@@ -285,7 +262,6 @@ def render_global_weather_section():
 
     alert_cities = set()
     cols = st.columns(min(len(city_reps), 3))
-
     for i, (city, (lat, lon)) in enumerate(sorted(city_reps.items())):
         warnings, error = get_weather_warnings_cached(lat, lon)
         with cols[i % 3]:
@@ -295,7 +271,6 @@ def render_global_weather_section():
             if len(warnings) == 0:
                 st.success(f"✅ {city} 当前无天气预警")
                 continue
-
             alert_cities.add(city)
             for warn in warnings[:3]:
                 severity = warn.get('severity', 'Unknown')
@@ -305,7 +280,6 @@ def render_global_weather_section():
                 sent = warn.get('sent', '')
                 instruction = warn.get('instruction', '')
                 level_cn, color = SEVERITY_MAP.get(severity, ('未知', '#9B9B9B'))
-
                 instruction_html = ""
                 if instruction:
                     instruction_html = f'''
@@ -314,7 +288,6 @@ def render_global_weather_section():
                             <div style="font-size: 12px; color: #555; margin-top: 4px;">{instruction}</div>
                         </details>
                     '''
-
                 st.markdown(f"""
                     <div style="border-left: 5px solid {color}; background: #F7F9FC; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px;">
                         <div style="font-weight: 600; font-size: 14px; color: {color};">{city} · {title}</div>
@@ -332,29 +305,25 @@ def render_global_weather_section():
         st.warning(f"⚠️ 当前有天气预警的城市：{', '.join(sorted(alert_cities))}")
     else:
         st.success("✅ 所有涉及城市当前均无天气预警")
-
     return alert_cities
 
 # ==========================================
-# 9. 【独立板块】当日城市天气
+# 9. 当日城市天气板块
 # ==========================================
 def render_global_weather_now_section():
     st.subheader("🌤️ 当日城市天气")
-
     city_reps, err = build_city_representatives()
     if err:
         st.info(f"💡 {err}")
         return
 
     cols = st.columns(min(len(city_reps), 3))
-
     for i, (city, (lat, lon)) in enumerate(sorted(city_reps.items())):
         weather, error = get_current_weather_cached(lat, lon)
         with cols[i % 3]:
             if error is not None or weather is None:
                 st.warning(f"⚠️ {city} 天气获取失败：{error or '未知'}")
                 continue
-
             temp = weather.get('temp', '--')
             feels = weather.get('feelsLike', '--')
             text = weather.get('text', '--')
@@ -363,18 +332,9 @@ def render_global_weather_now_section():
             wind_scale = weather.get('windScale', '--')
             obs_time = weather.get('obsTime', '')
             icon = weather_emoji(text)
-
-            # 显示时只保留时分
             time_str = obs_time[11:16] if len(obs_time) >= 16 else obs_time
-
             st.markdown(f"""
-                <div style="
-                    background: linear-gradient(135deg, #E8F4FD 0%, #F7F9FC 100%);
-                    border: 1px solid #D6E4F0;
-                    border-radius: 10px;
-                    padding: 16px 18px;
-                    margin-bottom: 10px;
-                ">
+                <div style="background: linear-gradient(135deg, #E8F4FD 0%, #F7F9FC 100%); border: 1px solid #D6E4F0; border-radius: 10px; padding: 16px 18px; margin-bottom: 10px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div style="font-size: 16px; font-weight: 600; color: #2C5282;">🏙️ {city}</div>
                         <div style="font-size: 32px;">{icon}</div>
@@ -408,9 +368,95 @@ with st.expander("🌤️ 当日城市天气板块", expanded=True):
 st.markdown("---")
 
 # ==========================================
-# 11. 单城市地图渲染函数
+# 11. 区域绘制函数（支持"保和红/其他黄"和"全红"两种模式）
 # ==========================================
-def render_city_map(city_name, city_df, category_name, config, alert_cities):
+def add_risk_zones_by_dit(fig, map_df, lon_col, lat_col, dim_col, highlight_baohe=True):
+    """
+    按蝶城分组画区域圈。
+    highlight_baohe=True：保和红圈 + 其他黄圈（防汛板块）
+    highlight_baohe=False：全部红圈（消防、治安板块）
+    """
+    if dim_col not in map_df.columns:
+        return 0, ["地图数据中缺少蝶城列"]
+
+    df_dit = map_df[~map_df[dim_col].astype(str).str.contains(STREET_KEYWORD, na=False)].copy()
+    if len(df_dit) == 0:
+        return 0, ["没有可用的蝶城项目"]
+
+    zones_drawn = 0
+    errors = []
+
+    if hasattr(go, 'Scattermap'):
+        scatter_cls = go.Scattermap
+    elif hasattr(go, 'Scattermapbox'):
+        scatter_cls = go.Scattermapbox
+    else:
+        return 0, ["当前 Plotly 版本不支持 Scattermap"]
+
+    COLOR_HIGHLIGHT = {'line': '#FF0000', 'fill': 'rgba(255, 0, 0, 0.20)', 'text': '#B00020'}
+    COLOR_NORMAL = {'line': '#FFB800', 'fill': 'rgba(255, 184, 0, 0.22)', 'text': '#8B6508'}
+    COLOR_ALL_RED = {'line': '#FF0000', 'fill': 'rgba(255, 0, 0, 0.18)', 'text': '#B00020'}
+
+    for dit_name, group in df_dit.groupby(dim_col):
+        coords = group[[lon_col, lat_col]].dropna().values
+        if len(coords) < 1:
+            continue
+
+        center_lon = coords[:, 0].mean()
+        center_lat = coords[:, 1].mean()
+
+        if len(coords) >= 2:
+            dists = np.sqrt((coords[:, 0] - center_lon)**2 + (coords[:, 1] - center_lat)**2)
+            radius = max(dists.max() * 1.6, 0.01)
+        else:
+            radius = 0.015
+
+        theta = np.linspace(0, 2 * np.pi, 100)
+        circle_lon = center_lon + radius * np.cos(theta)
+        circle_lat = center_lat + radius * np.sin(theta)
+
+        # 配色选择
+        if not highlight_baohe:
+            color_cfg = COLOR_ALL_RED
+        else:
+            color_cfg = COLOR_HIGHLIGHT if '保和' in str(dit_name) else COLOR_NORMAL
+
+        try:
+            fig.add_trace(scatter_cls(
+                lon=circle_lon,
+                lat=circle_lat,
+                mode='lines',
+                line=dict(color=color_cfg['line'], width=3),
+                fill='toself',
+                fillcolor=color_cfg['fill'],
+                hoverinfo='skip',
+                showlegend=False,
+                name=str(dit_name)
+            ))
+
+            fig.add_trace(scatter_cls(
+                lon=[center_lon],
+                lat=[center_lat],
+                mode='text',
+                text=[str(dit_name)],
+                textfont=dict(size=13, color=color_cfg['text'],
+                              family='Microsoft YaHei, SimHei, sans-serif'),
+                textposition='middle center',
+                hoverinfo='skip',
+                showlegend=False,
+                name=''
+            ))
+
+            zones_drawn += 1
+        except Exception as e:
+            errors.append(f"{dit_name}: {e}")
+
+    return zones_drawn, errors
+
+# ==========================================
+# 12. 单城市地图渲染函数
+# ==========================================
+def render_city_map(city_name, city_df, category_name, config, alert_cities, highlight_baohe=True):
     risk_col = config['risk']
     point_col = config['point']
     dim_col = COMMON_COLS['蝶城']
@@ -440,34 +486,89 @@ def render_city_map(city_name, city_df, category_name, config, alert_cities):
 
     cfg = CITY_MAP_CONFIG.get(city_name, {"center": {"lat": 30.67, "lon": 104.06}, "zoom": 9})
 
-    with st.spinner(f"正在加载 {city_name} 地图..."):
-        fig = px.scatter_map(
-            map_df,
-            lat=lat_col,
-            lon=lon_col,
-            color_discrete_sequence=['#FF0000'],
-            text=point_col,
-            hover_name=point_col,
-            hover_data={
-                risk_col: True,
-                COMMON_COLS['片区']: True,
-                lon_col: False,
-                lat_col: False
-            },
-            zoom=cfg["zoom"],
-            center=cfg["center"],
-            title=f"{category_name} - {city_name} 高风险项目分布",
-            map_style="carto-positron-nolabels",
-            height=550
-        )
-        fig.update_traces(
-            textposition="top center",
-            textfont=dict(size=10, color="#333"),
-            marker=dict(size=18, opacity=0.9)
-        )
+    if hasattr(go, 'Scattermap'):
+        scatter_cls = go.Scattermap
+        map_layout_key = 'map'
+    elif hasattr(go, 'Scattermapbox'):
+        scatter_cls = go.Scattermapbox
+        map_layout_key = 'mapbox'
+    else:
+        st.error("当前 Plotly 版本不支持 Scattermap")
+        return
 
+    def make_hover(df):
+        return [
+            f"<b>{row[point_col]}</b><br>蝶城：{row[dim_col]}<br>{risk_col}：{row[risk_col]}"
+            for _, row in df.iterrows()
+        ]
+
+    with st.spinner(f"正在加载 {city_name} 地图..."):
+        fig = go.Figure()
+
+        if highlight_baohe:
+            # 【防汛板块】保和红点大、其他黄点小
+            is_baohe = map_df[dim_col].astype(str).str.contains('保和', na=False)
+            baohe_df = map_df[is_baohe].copy()
+            other_df = map_df[~is_baohe].copy()
+
+            if len(other_df) > 0:
+                fig.add_trace(scatter_cls(
+                    lon=other_df[lon_col],
+                    lat=other_df[lat_col],
+                    mode='markers+text',
+                    marker=dict(size=9, color='#FFC107', opacity=0.9),
+                    text=other_df[point_col].astype(str).tolist(),
+                    textposition='top center',
+                    textfont=dict(size=8, color='#666'),
+                    hovertext=make_hover(other_df),
+                    hoverinfo='text',
+                    showlegend=False,
+                    name='其他蝶城'
+                ))
+
+            if len(baohe_df) > 0:
+                fig.add_trace(scatter_cls(
+                    lon=baohe_df[lon_col],
+                    lat=baohe_df[lat_col],
+                    mode='markers+text',
+                    marker=dict(size=18, color='#FF0000', opacity=0.9),
+                    text=baohe_df[point_col].astype(str).tolist(),
+                    textposition='top center',
+                    textfont=dict(size=10, color='#333'),
+                    hovertext=make_hover(baohe_df),
+                    hoverinfo='text',
+                    showlegend=False,
+                    name='保和蝶城'
+                ))
+        else:
+            # 【消防/治安板块】全部红点
+            if len(map_df) > 0:
+                fig.add_trace(scatter_cls(
+                    lon=map_df[lon_col],
+                    lat=map_df[lat_col],
+                    mode='markers+text',
+                    marker=dict(size=18, color='#FF0000', opacity=0.9),
+                    text=map_df[point_col].astype(str).tolist(),
+                    textposition='top center',
+                    textfont=dict(size=10, color='#333'),
+                    hovertext=make_hover(map_df),
+                    hoverinfo='text',
+                    showlegend=False,
+                    name='高风险项目'
+                ))
+
+        # 区域圈（跟随 highlight_baohe 开关）
+        zones_drawn, errors = add_risk_zones_by_dit(
+            fig, map_df, lon_col, lat_col, dim_col, highlight_baohe=highlight_baohe
+        )
+        if zones_drawn == 0 and errors:
+            with st.expander(f"⚠️ {city_name} 高风险区域绘制提示"):
+                for e in errors:
+                    st.write(f"- {e}")
+
+        # 预警图标
         if city_name in alert_cities:
-            fig.add_scattermap(
+            fig.add_trace(scatter_cls(
                 lat=[map_df.iloc[0][lat_col]],
                 lon=[map_df.iloc[0][lon_col]],
                 mode='markers+text',
@@ -476,16 +577,28 @@ def render_city_map(city_name, city_df, category_name, config, alert_cities):
                 textfont=dict(size=40, color='#FFAA00'),
                 textposition='top center',
                 hoverinfo='skip',
-                showlegend=False
-            )
+                showlegend=False,
+                name='预警'
+            ))
 
-        fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0})
+        layout_kwargs = {
+            "margin": {"r": 0, "t": 40, "l": 0, "b": 0},
+            "height": 550,
+            "title": f"{category_name} - {city_name} 高风险项目分布",
+        }
+        layout_kwargs[map_layout_key] = dict(
+            style="carto-positron-nolabels",
+            center=cfg["center"],
+            zoom=cfg["zoom"]
+        )
+        fig.update_layout(**layout_kwargs)
         st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================
-# 12. 板块渲染函数
+# 13. 板块渲染函数
 # ==========================================
-def render_category_dashboard(category_name, high_risk_df, n_city, n_street, config, alert_cities, show_xichang=True):
+def render_category_dashboard(category_name, high_risk_df, n_city, n_street, config, alert_cities,
+                              show_xichang=True, highlight_baohe=True):
     risk_col = config['risk']
     point_col = config['point']
     desc_col = config['desc']
@@ -501,7 +614,6 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
     col3.metric("🚨 高风险街区住宅项目数", n_street)
 
     st.markdown("---")
-
     st.subheader(f"🗺️ {category_name} - 高风险项目地图分布")
 
     hr_copy = high_risk_df.copy()
@@ -513,13 +625,16 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
 
     left_col, right_col = st.columns(2)
     with left_col:
-        render_city_map("成都", chengdu_df, category_name, config, alert_cities)
+        render_city_map("成都", chengdu_df, category_name, config, alert_cities,
+                        highlight_baohe=highlight_baohe)
     with right_col:
-        render_city_map("昆明", kunming_df, category_name, config, alert_cities)
+        render_city_map("昆明", kunming_df, category_name, config, alert_cities,
+                        highlight_baohe=highlight_baohe)
 
     if show_xichang and len(xichang_df) > 0:
         st.markdown(f"**🗺️ {category_name} - 西昌 高风险项目分布**")
-        render_city_map("西昌", xichang_df, category_name, config, alert_cities)
+        render_city_map("西昌", xichang_df, category_name, config, alert_cities,
+                        highlight_baohe=highlight_baohe)
 
     st.markdown("---")
     st.subheader(f"🚨 {category_name} - 高风险点位详细清单")
@@ -535,7 +650,6 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
             ["全部高风险项目", "仅看高风险蝶城项目", "仅看高风险街区住宅项目"],
             horizontal=True, key=f"radio_{category_name}"
         )
-
         detail_df = high_risk_df[display_cols].copy()
         if dim_col in detail_df.columns:
             if view_type == "仅看高风险蝶城项目":
@@ -560,16 +674,16 @@ def render_category_dashboard(category_name, high_risk_df, n_city, n_street, con
                 data=csv, file_name=f'{category_name}_高风险点位清单.csv',
                 mime='text/csv', key=f'download_{category_name}'
             )
-
     return detail_df
 
 # ==========================================
-# 13. 主界面：三个风险板块
+# 14. 主界面：三个风险板块
 # ==========================================
 with st.expander("🌊 防汛板块", expanded=True):
     detail_fangxun = render_category_dashboard(
         "防汛", hr_fangxun, n_city_fx, n_street_fx, TAB_CONFIG['防汛'], alert_cities_global,
-        show_xichang=True
+        show_xichang=True,
+        highlight_baohe=True     # 防汛：保和红点/其他黄点
     )
 
 st.markdown("---")
@@ -577,7 +691,8 @@ st.markdown("---")
 with st.expander("🔥 消防板块", expanded=True):
     detail_xiaofang = render_category_dashboard(
         "消防", hr_xiaofang, n_city_xf, n_street_xf, TAB_CONFIG['消防'], alert_cities_global,
-        show_xichang=False
+        show_xichang=False,
+        highlight_baohe=False    # 消防：全部红点
     )
 
 st.markdown("---")
@@ -585,11 +700,12 @@ st.markdown("---")
 with st.expander("🚓 治安板块", expanded=True):
     detail_zhian = render_category_dashboard(
         "治安", hr_zhian, n_city_za, n_street_za, TAB_CONFIG['治安'], alert_cities_global,
-        show_xichang=True
+        show_xichang=True,
+        highlight_baohe=False    # 治安：全部红点
     )
 
 # ==========================================
-# 14. 一键导出完整报告
+# 15. 一键导出完整报告
 # ==========================================
 st.markdown("---")
 st.subheader("📤 导出完整风险报告")
@@ -621,7 +737,7 @@ st.download_button(
 )
 
 # ==========================================
-# 15. 原始数据展开查看
+# 16. 原始数据展开查看
 # ==========================================
 st.markdown("---")
 with st.expander("点击查看原始数据表格"):
