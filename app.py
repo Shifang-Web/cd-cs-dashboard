@@ -18,7 +18,7 @@ except ImportError:
 # 1. 页面基础设置
 # ==========================================
 st.set_page_config(page_title="项目风险看板", layout="wide")
-st.title("🚨 成都城市营业部项目风险看板")
+st.title("🚨 成都城市营业部项目风险看板 🚨")
 
 try:
     mtime = os.path.getmtime("data.xlsx")
@@ -580,7 +580,7 @@ st.markdown("---")
 # 14. 三板块横向滚动清单
 # ==========================================
 def render_all_scrolling_boards(sections, height=520, default_speed=2.5):
-    st.subheader("🚨 高风险点位清单（微信联系人式滚动）")
+    st.subheader("🚨 高风险点位清单")
 
     valid = [(n, d, c) for n, d, c in sections if d is not None and len(d) > 0]
     if not valid:
