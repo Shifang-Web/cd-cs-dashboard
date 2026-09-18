@@ -1,12 +1,18 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import requests
 import io
 import os
 import datetime
+import html as html_module
 import numpy as np
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
 
 # ==========================================
 # 1. 页面基础设置
@@ -77,6 +83,8 @@ TAB_CONFIG = {
     '治安': {'risk': '治安风险等级', 'point': '项目名称', 'desc': '风险描述'}
 }
 
+CATEGORY_EMOJI = {'防汛': '🌊', '消防': '🔥', '治安': '🚓'}
+
 SEVERITY_MAP = {
     'Extreme': ('红色', '#D0021B'),
     'Severe':  ('橙色', '#F5A623'),
@@ -87,12 +95,6 @@ SEVERITY_MAP = {
     '橙色':    ('橙色', '#F5A623'),
     '黄色':    ('黄色', '#F5A623'),
     '蓝色':    ('蓝色', '#4A90E2'),
-}
-
-CITY_MAP_CONFIG = {
-    '成都': {"center": {"lat": 30.67, "lon": 104.06}, "zoom": 9},
-    '昆明': {"center": {"lat": 25.04, "lon": 102.71}, "zoom": 9},
-    '西昌': {"center": {"lat": 27.89, "lon": 102.26}, "zoom": 10},
 }
 
 def weather_emoji(text):
@@ -368,344 +370,302 @@ with st.expander("🌤️ 当日城市天气板块", expanded=True):
 st.markdown("---")
 
 # ==========================================
-# 11. 区域绘制函数（支持"保和红/其他黄"和"全红"两种模式）
+# 11. 板块数据准备函数（只算详情，不渲染）
 # ==========================================
-def add_risk_zones_by_dit(fig, map_df, lon_col, lat_col, dim_col, highlight_baohe=True):
-    """
-    按蝶城分组画区域圈。
-    highlight_baohe=True：保和红圈 + 其他黄圈（防汛板块）
-    highlight_baohe=False：全部红圈（消防、治安板块）
-    """
-    if dim_col not in map_df.columns:
-        return 0, ["地图数据中缺少蝶城列"]
-
-    df_dit = map_df[~map_df[dim_col].astype(str).str.contains(STREET_KEYWORD, na=False)].copy()
-    if len(df_dit) == 0:
-        return 0, ["没有可用的蝶城项目"]
-
-    zones_drawn = 0
-    errors = []
-
-    if hasattr(go, 'Scattermap'):
-        scatter_cls = go.Scattermap
-    elif hasattr(go, 'Scattermapbox'):
-        scatter_cls = go.Scattermapbox
-    else:
-        return 0, ["当前 Plotly 版本不支持 Scattermap"]
-
-    COLOR_HIGHLIGHT = {'line': '#FF0000', 'fill': 'rgba(255, 0, 0, 0.20)', 'text': '#B00020'}
-    COLOR_NORMAL = {'line': '#FFB800', 'fill': 'rgba(255, 184, 0, 0.22)', 'text': '#8B6508'}
-    COLOR_ALL_RED = {'line': '#FF0000', 'fill': 'rgba(255, 0, 0, 0.18)', 'text': '#B00020'}
-
-    for dit_name, group in df_dit.groupby(dim_col):
-        coords = group[[lon_col, lat_col]].dropna().values
-        if len(coords) < 1:
-            continue
-
-        center_lon = coords[:, 0].mean()
-        center_lat = coords[:, 1].mean()
-
-        if len(coords) >= 2:
-            dists = np.sqrt((coords[:, 0] - center_lon)**2 + (coords[:, 1] - center_lat)**2)
-            radius = max(dists.max() * 1.6, 0.01)
-        else:
-            radius = 0.015
-
-        theta = np.linspace(0, 2 * np.pi, 100)
-        circle_lon = center_lon + radius * np.cos(theta)
-        circle_lat = center_lat + radius * np.sin(theta)
-
-        # 配色选择
-        if not highlight_baohe:
-            color_cfg = COLOR_ALL_RED
-        else:
-            color_cfg = COLOR_HIGHLIGHT if '保和' in str(dit_name) else COLOR_NORMAL
-
-        try:
-            fig.add_trace(scatter_cls(
-                lon=circle_lon,
-                lat=circle_lat,
-                mode='lines',
-                line=dict(color=color_cfg['line'], width=3),
-                fill='toself',
-                fillcolor=color_cfg['fill'],
-                hoverinfo='skip',
-                showlegend=False,
-                name=str(dit_name)
-            ))
-
-            fig.add_trace(scatter_cls(
-                lon=[center_lon],
-                lat=[center_lat],
-                mode='text',
-                text=[str(dit_name)],
-                textfont=dict(size=13, color=color_cfg['text'],
-                              family='Microsoft YaHei, SimHei, sans-serif'),
-                textposition='middle center',
-                hoverinfo='skip',
-                showlegend=False,
-                name=''
-            ))
-
-            zones_drawn += 1
-        except Exception as e:
-            errors.append(f"{dit_name}: {e}")
-
-    return zones_drawn, errors
-
-# ==========================================
-# 12. 单城市地图渲染函数
-# ==========================================
-def render_city_map(city_name, city_df, category_name, config, alert_cities, highlight_baohe=True):
+def build_category_detail(category_name, high_risk_df, config):
+    """返回该板块的详情 DataFrame（用于横排指标和滚动清单）。"""
     risk_col = config['risk']
     point_col = config['point']
-    dim_col = COMMON_COLS['蝶城']
-    lon_col = COMMON_COLS['经度']
-    lat_col = COMMON_COLS['纬度']
+    desc_col = config['desc']
 
-    if len(city_df) == 0:
-        st.info(f"💡 {city_name} 无高风险项目")
-        return
+    if len(high_risk_df) == 0:
+        return pd.DataFrame()
 
-    if lon_col not in city_df.columns or lat_col not in city_df.columns:
-        st.info(f"💡 {city_name} 数据缺少经纬度列")
-        return
+    if point_col not in high_risk_df.columns or desc_col not in high_risk_df.columns:
+        return pd.DataFrame()
 
-    map_df = city_df.copy()
-    map_df[dim_col] = map_df[dim_col].fillna('街区住宅项目')
-    map_df[lon_col] = pd.to_numeric(map_df[lon_col], errors='coerce')
-    map_df[lat_col] = pd.to_numeric(map_df[lat_col], errors='coerce')
-    map_df = map_df.dropna(subset=[lon_col, lat_col])
-
-    if len(map_df) == 0:
-        st.warning(f"⚠️ {city_name} 无有效坐标数据")
-        return
-
-    if map_df.iloc[0][lon_col] < 50:
-        map_df[[lon_col, lat_col]] = map_df[[lat_col, lon_col]]
-
-    cfg = CITY_MAP_CONFIG.get(city_name, {"center": {"lat": 30.67, "lon": 104.06}, "zoom": 9})
-
-    if hasattr(go, 'Scattermap'):
-        scatter_cls = go.Scattermap
-        map_layout_key = 'map'
-    elif hasattr(go, 'Scattermapbox'):
-        scatter_cls = go.Scattermapbox
-        map_layout_key = 'mapbox'
-    else:
-        st.error("当前 Plotly 版本不支持 Scattermap")
-        return
-
-    def make_hover(df):
-        return [
-            f"<b>{row[point_col]}</b><br>蝶城：{row[dim_col]}<br>{risk_col}：{row[risk_col]}"
-            for _, row in df.iterrows()
-        ]
-
-    with st.spinner(f"正在加载 {city_name} 地图..."):
-        fig = go.Figure()
-
-        if highlight_baohe:
-            # 【防汛板块】保和红点大、其他黄点小
-            is_baohe = map_df[dim_col].astype(str).str.contains('保和', na=False)
-            baohe_df = map_df[is_baohe].copy()
-            other_df = map_df[~is_baohe].copy()
-
-            if len(other_df) > 0:
-                fig.add_trace(scatter_cls(
-                    lon=other_df[lon_col],
-                    lat=other_df[lat_col],
-                    mode='markers+text',
-                    marker=dict(size=9, color='#FFC107', opacity=0.9),
-                    text=other_df[point_col].astype(str).tolist(),
-                    textposition='top center',
-                    textfont=dict(size=8, color='#666'),
-                    hovertext=make_hover(other_df),
-                    hoverinfo='text',
-                    showlegend=False,
-                    name='其他蝶城'
-                ))
-
-            if len(baohe_df) > 0:
-                fig.add_trace(scatter_cls(
-                    lon=baohe_df[lon_col],
-                    lat=baohe_df[lat_col],
-                    mode='markers+text',
-                    marker=dict(size=18, color='#FF0000', opacity=0.9),
-                    text=baohe_df[point_col].astype(str).tolist(),
-                    textposition='top center',
-                    textfont=dict(size=10, color='#333'),
-                    hovertext=make_hover(baohe_df),
-                    hoverinfo='text',
-                    showlegend=False,
-                    name='保和蝶城'
-                ))
-        else:
-            # 【消防/治安板块】全部红点
-            if len(map_df) > 0:
-                fig.add_trace(scatter_cls(
-                    lon=map_df[lon_col],
-                    lat=map_df[lat_col],
-                    mode='markers+text',
-                    marker=dict(size=18, color='#FF0000', opacity=0.9),
-                    text=map_df[point_col].astype(str).tolist(),
-                    textposition='top center',
-                    textfont=dict(size=10, color='#333'),
-                    hovertext=make_hover(map_df),
-                    hoverinfo='text',
-                    showlegend=False,
-                    name='高风险项目'
-                ))
-
-        # 区域圈（跟随 highlight_baohe 开关）
-        zones_drawn, errors = add_risk_zones_by_dit(
-            fig, map_df, lon_col, lat_col, dim_col, highlight_baohe=highlight_baohe
-        )
-        if zones_drawn == 0 and errors:
-            with st.expander(f"⚠️ {city_name} 高风险区域绘制提示"):
-                for e in errors:
-                    st.write(f"- {e}")
-
-        # 预警图标
-        if city_name in alert_cities:
-            fig.add_trace(scatter_cls(
-                lat=[map_df.iloc[0][lat_col]],
-                lon=[map_df.iloc[0][lon_col]],
-                mode='markers+text',
-                marker=dict(size=10, color='rgba(255,215,0,0.001)'),
-                text=['⚠️'],
-                textfont=dict(size=40, color='#FFAA00'),
-                textposition='top center',
-                hoverinfo='skip',
-                showlegend=False,
-                name='预警'
-            ))
-
-        layout_kwargs = {
-            "margin": {"r": 0, "t": 40, "l": 0, "b": 0},
-            "height": 550,
-            "title": f"{category_name} - {city_name} 高风险项目分布",
-        }
-        layout_kwargs[map_layout_key] = dict(
-            style="carto-positron-nolabels",
-            center=cfg["center"],
-            zoom=cfg["zoom"]
-        )
-        fig.update_layout(**layout_kwargs)
-        st.plotly_chart(fig, use_container_width=True)
+    display_cols = [col for col in [COMMON_COLS['片区'], COMMON_COLS['蝶城'], risk_col, point_col, desc_col]
+                    if col in high_risk_df.columns]
+    detail = high_risk_df[display_cols].copy()
+    detail[desc_col] = detail[desc_col].fillna('暂无详细描述').astype(str)
+    detail[point_col] = detail[point_col].fillna('未知点位').astype(str)
+    return detail
 
 # ==========================================
-# 13. 板块渲染函数
+# 12. 微信联系人式清单：setInterval + scrollTop 驱动滚动
 # ==========================================
-def render_category_dashboard(category_name, high_risk_df, n_city, n_street, config, alert_cities,
-                              show_xichang=True, highlight_baohe=True):
+def _esc(v):
+    return html_module.escape(str(v) if v is not None else '')
+
+
+def _build_contacts_doc(df, config, height=520, px_per_sec=22.0, paused=False):
+    """微信联系人风格列表 + setInterval + scrollTop 逐帧驱动。"""
     risk_col = config['risk']
     point_col = config['point']
     desc_col = config['desc']
     dim_col = COMMON_COLS['蝶城']
+    area_col = COMMON_COLS['片区']
 
-    if len(high_risk_df) == 0:
-        st.success(f"🎉 {category_name} 当前暂无高风险数据！")
-        return pd.DataFrame()
+    rows = []
+    for _, row in df.iterrows():
+        area = _esc(row.get(area_col, ''))
+        dit = _esc(row.get(dim_col, ''))
+        risk = _esc(row.get(risk_col, ''))
+        point = _esc(row.get(point_col, ''))
+        desc = _esc(row.get(desc_col, ''))
+        avatar_char = point.strip()[:1] if point.strip() else '项'
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("🚨 高风险项目总数", len(high_risk_df))
-    col2.metric("🚨 高风险蝶城项目数", n_city)
-    col3.metric("🚨 高风险街区住宅项目数", n_street)
-
-    st.markdown("---")
-    st.subheader(f"🗺️ {category_name} - 高风险项目地图分布")
-
-    hr_copy = high_risk_df.copy()
-    hr_copy['_city'] = hr_copy.apply(extract_city, axis=1)
-
-    chengdu_df = hr_copy[hr_copy['_city'] == '成都']
-    kunming_df = hr_copy[hr_copy['_city'] == '昆明']
-    xichang_df = hr_copy[hr_copy['_city'] == '西昌']
-
-    left_col, right_col = st.columns(2)
-    with left_col:
-        render_city_map("成都", chengdu_df, category_name, config, alert_cities,
-                        highlight_baohe=highlight_baohe)
-    with right_col:
-        render_city_map("昆明", kunming_df, category_name, config, alert_cities,
-                        highlight_baohe=highlight_baohe)
-
-    if show_xichang and len(xichang_df) > 0:
-        st.markdown(f"**🗺️ {category_name} - 西昌 高风险项目分布**")
-        render_city_map("西昌", xichang_df, category_name, config, alert_cities,
-                        highlight_baohe=highlight_baohe)
-
-    st.markdown("---")
-    st.subheader(f"🚨 {category_name} - 高风险点位详细清单")
-
-    detail_df = pd.DataFrame()
-    if point_col not in high_risk_df.columns or desc_col not in high_risk_df.columns:
-        st.info(f"💡 提示：缺少 {point_col} 或 {desc_col} 列，无法生成详细清单。")
-    else:
-        display_cols = [col for col in [COMMON_COLS['片区'], COMMON_COLS['蝶城'], risk_col, point_col, desc_col]
-                        if col in high_risk_df.columns]
-        view_type = st.radio(
-            "选择查看范围：",
-            ["全部高风险项目", "仅看高风险蝶城项目", "仅看高风险街区住宅项目"],
-            horizontal=True, key=f"radio_{category_name}"
+        rows.append(
+            '<div class="rk-row">'
+            '  <div class="rk-avatar">' + avatar_char + '</div>'
+            '  <div class="rk-main">'
+            '    <div class="rk-line1">'
+            f'      <span class="rk-name">{point}</span>'
+            f'      <span class="rk-badge">{risk}</span>'
+            '    </div>'
+            f'    <div class="rk-line2">🏢 {dit} · 📍 {area}</div>'
+            f'    <div class="rk-line3">{desc}</div>'
+            '  </div>'
+            '</div>'
         )
-        detail_df = high_risk_df[display_cols].copy()
-        if dim_col in detail_df.columns:
-            if view_type == "仅看高风险蝶城项目":
-                detail_df = detail_df[~detail_df[dim_col].astype(str).str.contains(STREET_KEYWORD, na=False)]
-            elif view_type == "仅看高风险街区住宅项目":
-                detail_df = detail_df[detail_df[dim_col].astype(str).str.contains(STREET_KEYWORD, na=False)]
 
-        detail_df[desc_col] = detail_df[desc_col].fillna('暂无详细描述').astype(str)
-        detail_df[point_col] = detail_df[point_col].fillna('未知点位').astype(str)
+    if not rows:
+        return "<!DOCTYPE html><html><body></body></html>"
 
-        if len(detail_df) == 0:
-            st.info(f"💡 {view_type} 条件下暂无数据。")
-        else:
-            st.error(f"⚠️ 当前筛选条件下存在 {len(detail_df)} 个高风险点位，请重点关注！")
-            st.dataframe(detail_df, use_container_width=True, column_config={
-                desc_col: st.column_config.TextColumn("详细描述", width="large"),
-                point_col: st.column_config.TextColumn("点位名称", width="medium")
-            })
-            csv = detail_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label=f"📥 下载 {category_name} 高风险清单 (CSV)",
-                data=csv, file_name=f'{category_name}_高风险点位清单.csv',
-                mime='text/csv', key=f'download_{category_name}'
+    single_html = "".join(rows)
+    auto_init = "false" if paused else "true"
+
+    doc = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><style>"
+        "*{box-sizing:border-box;}"
+        "html,body{margin:0;padding:0;background:#FFFFFF;"
+        "font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;}"
+        ".rk-viewport{"
+        f"height:{int(height)}px;"
+        "overflow-y:auto;overflow-x:hidden;"
+        "scrollbar-width:none;-ms-overflow-style:none;"
+        "border:1px solid #E5E7EB;border-radius:10px;background:#FFFFFF;"
+        "}"
+        ".rk-viewport::-webkit-scrollbar{display:none;width:0;height:0;}"
+        ".rk-row{"
+        "display:flex;align-items:flex-start;gap:10px;"
+        "padding:10px 12px;border-bottom:1px solid #F3F4F6;"
+        "}"
+        ".rk-avatar{"
+        "width:38px;height:38px;border-radius:8px;flex:0 0 38px;"
+        "background:#D0021B;color:#FFFFFF;"
+        "display:flex;align-items:center;justify-content:center;"
+        "font-weight:600;font-size:15px;"
+        "}"
+        ".rk-main{flex:1;min-width:0;}"
+        ".rk-line1{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}"
+        ".rk-name{font-weight:600;color:#111827;font-size:13.5px;"
+        "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%;}"
+        ".rk-badge{"
+        "background:#FEE2E2;color:#B91C1C;font-size:10px;font-weight:600;"
+        "padding:1px 6px;border-radius:4px;white-space:nowrap;"
+        "}"
+        ".rk-line2{color:#6B7280;font-size:11.5px;margin-top:2px;"
+        "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
+        ".rk-line3{color:#4B5563;font-size:12px;line-height:1.5;margin-top:3px;"
+        "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;"
+        "overflow:hidden;}"
+        "</style></head><body>"
+        '<div class="rk-viewport" id="vp">'
+        f'<div id="single">{single_html}</div>'
+        f'<div>{single_html}</div>'
+        '</div>'
+        "<script>"
+        "(function(){"
+        "var vp=document.getElementById('vp');"
+        "var single=document.getElementById('single');"
+        f"var SPEED={float(px_per_sec)};"
+        f"var AUTO={auto_init};"
+        "var paused=false;"
+        "var h=0;"
+        "var y=0;"
+        "var acc=0;"
+        "var INTERVAL=30;"
+        "function measure(){"
+        "  var hh=single.offsetHeight;"
+        "  if(hh>0)h=hh;"
+        "}"
+        "measure();"
+        "setTimeout(measure,100);"
+        "setTimeout(measure,400);"
+        "setTimeout(measure,1000);"
+        "window.addEventListener('resize',measure);"
+        "setInterval(function(){"
+        "  if(h<=0){measure();return;}"
+        "  if(!AUTO||paused)return;"
+        "  acc+=SPEED*INTERVAL/1000;"
+        "  var step=Math.floor(acc);"
+        "  if(step<=0)return;"
+        "  acc-=step;"
+        "  y+=step;"
+        "  while(y>=h){y-=h;}"
+        "  vp.scrollTop=y;"
+        "},INTERVAL);"
+        "vp.addEventListener('mouseenter',function(){paused=true;});"
+        "vp.addEventListener('mouseleave',function(){paused=false;});"
+        "})();"
+        "</script>"
+        "</body></html>"
+    )
+    return doc
+
+
+def render_scrolling_list(df, config, height=520, seconds_per_item=2.5, paused=False):
+    """条目高度约 90px，秒/条 换算为 px/秒。"""
+    px_per_sec = max(12.0, 90.0 / max(0.5, float(seconds_per_item)))
+    doc = _build_contacts_doc(df, config, height=height,
+                              px_per_sec=px_per_sec, paused=paused)
+    components.html(doc, height=int(height) + 4, scrolling=False)
+
+
+def _filter_by_view(df, view_type):
+    dim_col = COMMON_COLS['蝶城']
+    if dim_col not in df.columns:
+        return df
+    if view_type == "仅看高风险蝶城项目":
+        return df[~df[dim_col].astype(str).str.contains(STREET_KEYWORD, na=False)]
+    if view_type == "仅看高风险街区住宅项目":
+        return df[df[dim_col].astype(str).str.contains(STREET_KEYWORD, na=False)]
+    return df
+
+
+# ==========================================
+# 13. 顶部：三个板块横排指标卡
+# ==========================================
+def render_metric_card(title_emoji, title_text, total, n_city, n_street, accent_color="#D0021B"):
+    """单个板块的横排指标卡。"""
+    st.markdown(f"""
+        <div style="border:1px solid #E5E7EB;border-radius:12px;padding:14px 16px;
+                    background:linear-gradient(135deg,#FFFFFF 0%,#F9FAFB 100%);
+                    height:100%;">
+            <div style="font-size:15px;font-weight:600;color:#1A202C;margin-bottom:10px;">
+                {title_emoji} {title_text}板块
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;
+                        padding:8px 0;border-top:1px solid #F3F4F6;">
+                <span style="color:#6B7280;font-size:12.5px;">🚨 高风险项目总数</span>
+                <span style="color:{accent_color};font-size:18px;font-weight:700;">{total}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;
+                        padding:8px 0;border-top:1px solid #F3F4F6;">
+                <span style="color:#6B7280;font-size:12.5px;">🏢 高风险蝶城项目</span>
+                <span style="color:{accent_color};font-size:18px;font-weight:700;">{n_city}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;
+                        padding:8px 0;border-top:1px solid #F3F4F6;">
+                <span style="color:#6B7280;font-size:12.5px;">🏘️ 高风险街区住宅</span>
+                <span style="color:{accent_color};font-size:18px;font-weight:700;">{n_street}</span>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+
+st.subheader("📊 三大板块高风险指标")
+metric_cols = st.columns(3)
+with metric_cols[0]:
+    render_metric_card("🌊", "防汛", len(hr_fangxun), n_city_fx, n_street_fx)
+with metric_cols[1]:
+    render_metric_card("🔥", "消防", len(hr_xiaofang), n_city_xf, n_street_xf)
+with metric_cols[2]:
+    render_metric_card("🚓", "治安", len(hr_zhian), n_city_za, n_street_za)
+
+st.markdown("---")
+
+# ==========================================
+# 14. 三板块横向滚动清单
+# ==========================================
+def render_all_scrolling_boards(sections, height=520, default_speed=2.5):
+    st.subheader("🚨 高风险点位清单（微信联系人式滚动）")
+
+    valid = [(n, d, c) for n, d, c in sections if d is not None and len(d) > 0]
+    if not valid:
+        st.success("🎉 当前所有板块均无高风险点位数据。")
+        return
+
+    ctrl1, ctrl2, ctrl3 = st.columns([3, 1, 1.2])
+    with ctrl1:
+        view_type = st.radio(
+            "查看范围：",
+            ["全部高风险项目", "仅看高风险蝶城项目", "仅看高风险街区住宅项目"],
+            horizontal=True,
+            key="carousel_view_type",
+        )
+    with ctrl2:
+        paused = st.toggle("⏸ 全部暂停", value=False, key="pause_scroll")
+    with ctrl3:
+        speed = st.slider(
+            "滚动速度（秒/条）", min_value=0.8, max_value=6.0,
+            value=float(default_speed), step=0.2, key="scroll_speed",
+            help="每条滑过的时间越短，滚动越快",
+        )
+
+    processed = []
+    for n, d, c in valid:
+        df = _filter_by_view(d.copy(), view_type).reset_index(drop=True)
+        if len(df) > 0:
+            processed.append((n, df, c))
+
+    if not processed:
+        st.info(f"💡 在「{view_type}」条件下暂无高风险点位。")
+        return
+
+    board_cols = st.columns(len(processed))
+    for i, (name, df, config) in enumerate(processed):
+        with board_cols[i]:
+            emoji = CATEGORY_EMOJI.get(name, "📋")
+            st.markdown(
+                f"<div style='font-size:15px;font-weight:600;color:#1A202C;"
+                f"padding:2px 0 4px 0;'>"
+                f"{emoji} {name}板块 · "
+                f"<span style='color:#D0021B;'>{len(df)}</span> 个高风险点位"
+                f"</div>",
+                unsafe_allow_html=True,
             )
-    return detail_df
+
+            csv = df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label=f"📥 下载 {name} 清单 (CSV)",
+                data=csv,
+                file_name=f"{name}_高风险点位清单.csv",
+                mime="text/csv",
+                key=f"download_board_{name}",
+                use_container_width=True,
+            )
+
+            render_scrolling_list(
+                df, config,
+                height=height,
+                seconds_per_item=speed,
+                paused=paused,
+            )
+
+            st.caption("💡 列表持续向上滚动，鼠标悬停可暂停")
+
 
 # ==========================================
-# 14. 主界面：三个风险板块
+# 15. 生成三个板块详情数据 + 渲染滚动清单
 # ==========================================
-with st.expander("🌊 防汛板块", expanded=True):
-    detail_fangxun = render_category_dashboard(
-        "防汛", hr_fangxun, n_city_fx, n_street_fx, TAB_CONFIG['防汛'], alert_cities_global,
-        show_xichang=True,
-        highlight_baohe=True     # 防汛：保和红点/其他黄点
-    )
+detail_fangxun = build_category_detail("防汛", hr_fangxun, TAB_CONFIG['防汛'])
+detail_xiaofang = build_category_detail("消防", hr_xiaofang, TAB_CONFIG['消防'])
+detail_zhian = build_category_detail("治安", hr_zhian, TAB_CONFIG['治安'])
 
-st.markdown("---")
-
-with st.expander("🔥 消防板块", expanded=True):
-    detail_xiaofang = render_category_dashboard(
-        "消防", hr_xiaofang, n_city_xf, n_street_xf, TAB_CONFIG['消防'], alert_cities_global,
-        show_xichang=False,
-        highlight_baohe=False    # 消防：全部红点
-    )
-
-st.markdown("---")
-
-with st.expander("🚓 治安板块", expanded=True):
-    detail_zhian = render_category_dashboard(
-        "治安", hr_zhian, n_city_za, n_street_za, TAB_CONFIG['治安'], alert_cities_global,
-        show_xichang=True,
-        highlight_baohe=False    # 治安：全部红点
-    )
+render_all_scrolling_boards(
+    [
+        ("防汛", detail_fangxun, TAB_CONFIG['防汛']),
+        ("消防", detail_xiaofang, TAB_CONFIG['消防']),
+        ("治安", detail_zhian, TAB_CONFIG['治安']),
+    ],
+    height=520,
+    default_speed=2.5,
+)
 
 # ==========================================
-# 15. 一键导出完整报告
+# 16. 一键导出完整报告
 # ==========================================
 st.markdown("---")
 st.subheader("📤 导出完整风险报告")
@@ -737,7 +697,7 @@ st.download_button(
 )
 
 # ==========================================
-# 16. 原始数据展开查看
+# 17. 原始数据展开查看
 # ==========================================
 st.markdown("---")
 with st.expander("点击查看原始数据表格"):
