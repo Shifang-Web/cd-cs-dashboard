@@ -253,7 +253,7 @@ def build_city_representatives():
     return city_reps, None
 
 # ==========================================
-# 8. 天气预警板块
+# 8. 天气预警板块（已修复：去除 HTML 缩进 + 字段名兼容）
 # ==========================================
 def render_global_weather_section():
     st.subheader("🌦️ 天气预警（全区域）")
@@ -273,35 +273,45 @@ def render_global_weather_section():
             if len(warnings) == 0:
                 st.success(f"✅ {city} 当前无天气预警")
                 continue
+
             alert_cities.add(city)
             for warn in warnings[:3]:
-                severity = warn.get('severity', 'Unknown')
-                title = warn.get('title', '天气预警')
-                text = warn.get('description', '')
-                event = warn.get('event', '')
-                sent = warn.get('sent', '')
+                # 兼容和风天气不同版本的字段名
+                severity = warn.get('severity', warn.get('level', 'Unknown'))
+                title = warn.get('title', warn.get('typeName', '天气预警'))
+                text = warn.get('text', warn.get('description', ''))
+                event = warn.get('typeName', warn.get('event', ''))
+                sent = warn.get('pubTime', warn.get('sent', ''))
                 instruction = warn.get('instruction', '')
+
                 level_cn, color = SEVERITY_MAP.get(severity, ('未知', '#9B9B9B'))
+
+                # 防御指南（拼接，无缩进）
                 instruction_html = ""
                 if instruction:
-                    instruction_html = f'''
-                        <details style="margin-top: 4px;">
-                            <summary style="font-size: 12px; color: #555; cursor: pointer;">展开防御指南</summary>
-                            <div style="font-size: 12px; color: #555; margin-top: 4px;">{instruction}</div>
-                        </details>
-                    '''
-                st.markdown(f"""
-                    <div style="border-left: 5px solid {color}; background: #F7F9FC; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px;">
-                        <div style="font-weight: 600; font-size: 14px; color: {color};">{city} · {title}</div>
-                        <div style="font-size: 12px; color: #666; margin: 4px 0;">等级：{level_cn} · 类型：{event}</div>
-                        <div style="font-size: 12px; color: #888; margin-top: 6px;">发布时间：{sent}</div>
-                        <details style="margin-top: 6px;">
-                            <summary style="font-size: 12px; color: #555; cursor: pointer;">展开详细描述</summary>
-                            <div style="font-size: 12px; color: #555; margin-top: 4px;">{text}</div>
-                        </details>
-                        {instruction_html}
-                    </div>
-                """, unsafe_allow_html=True)
+                    instruction_html = (
+                        '<details style="margin-top:4px;">'
+                        '<summary style="font-size:12px;color:#555;cursor:pointer;">展开防御指南</summary>'
+                        f'<div style="font-size:12px;color:#555;margin-top:4px;">{instruction}</div>'
+                        '</details>'
+                    )
+
+                # 主卡片（拼接，无缩进，避免被 Markdown 识别为代码块）
+                card_html = (
+                    f'<div style="border-left:5px solid {color};background:#F7F9FC;padding:10px 14px;'
+                    'border-radius:6px;margin-bottom:8px;">'
+                    f'<div style="font-weight:600;font-size:14px;color:{color};">{city} · {title}</div>'
+                    f'<div style="font-size:12px;color:#666;margin:4px 0;">等级：{level_cn} · 类型：{event}</div>'
+                    f'<div style="font-size:12px;color:#888;margin-top:6px;">发布时间：{sent}</div>'
+                    '<details style="margin-top:6px;">'
+                    '<summary style="font-size:12px;color:#555;cursor:pointer;">展开详细描述</summary>'
+                    f'<div style="font-size:12px;color:#555;margin-top:4px;">{text}</div>'
+                    '</details>'
+                    f'{instruction_html}'
+                    '</div>'
+                )
+
+                st.markdown(card_html, unsafe_allow_html=True)
 
     if alert_cities:
         st.warning(f"⚠️ 当前有天气预警的城市：{', '.join(sorted(alert_cities))}")
@@ -335,26 +345,29 @@ def render_global_weather_now_section():
             obs_time = weather.get('obsTime', '')
             icon = weather_emoji(text)
             time_str = obs_time[11:16] if len(obs_time) >= 16 else obs_time
-            st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #E8F4FD 0%, #F7F9FC 100%); border: 1px solid #D6E4F0; border-radius: 10px; padding: 16px 18px; margin-bottom: 10px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div style="font-size: 16px; font-weight: 600; color: #2C5282;">🏙️ {city}</div>
-                        <div style="font-size: 32px;">{icon}</div>
-                    </div>
-                    <div style="font-size: 28px; font-weight: 700; color: #1A365D; margin: 6px 0;">
-                        {temp}<span style="font-size: 16px; font-weight: 400;">°C</span>
-                        <span style="font-size: 14px; font-weight: 400; color: #4A5568; margin-left: 8px;">{text}</span>
-                    </div>
-                    <div style="font-size: 12px; color: #4A5568; margin-top: 6px; line-height: 1.8;">
-                        🌡️ 体感温度：{feels}°C<br/>
-                        💧 相对湿度：{humidity}%<br/>
-                        🌬️ 风向风力：{wind_dir} {wind_scale}级
-                    </div>
-                    <div style="font-size: 11px; color: #A0AEC0; margin-top: 8px; text-align: right;">
-                        更新时间：{time_str}
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
+
+            now_html = (
+                '<div style="background:linear-gradient(135deg,#E8F4FD 0%,#F7F9FC 100%);'
+                'border:1px solid #D6E4F0;border-radius:10px;padding:16px 18px;margin-bottom:10px;">'
+                '<div style="display:flex;justify-content:space-between;align-items:center;">'
+                f'<div style="font-size:16px;font-weight:600;color:#2C5282;">🏙️ {city}</div>'
+                f'<div style="font-size:32px;">{icon}</div>'
+                '</div>'
+                '<div style="font-size:28px;font-weight:700;color:#1A365D;margin:6px 0;">'
+                f'{temp}<span style="font-size:16px;font-weight:400;">°C</span>'
+                f'<span style="font-size:14px;font-weight:400;color:#4A5568;margin-left:8px;">{text}</span>'
+                '</div>'
+                '<div style="font-size:12px;color:#4A5568;margin-top:6px;line-height:1.8;">'
+                f'🌡️ 体感温度：{feels}°C<br/>'
+                f'💧 相对湿度：{humidity}%<br/>'
+                f'🌬️ 风向风力：{wind_dir} {wind_scale}级'
+                '</div>'
+                '<div style="font-size:11px;color:#A0AEC0;margin-top:8px;text-align:right;">'
+                f'更新时间：{time_str}'
+                '</div>'
+                '</div>'
+            )
+            st.markdown(now_html, unsafe_allow_html=True)
 
 # ==========================================
 # 10. 渲染两个独立板块
@@ -539,30 +552,30 @@ def _filter_by_view(df, view_type):
 # ==========================================
 def render_metric_card(title_emoji, title_text, total, n_city, n_street, accent_color="#D0021B"):
     """单个板块的横排指标卡。"""
-    st.markdown(f"""
-        <div style="border:1px solid #E5E7EB;border-radius:12px;padding:14px 16px;
-                    background:linear-gradient(135deg,#FFFFFF 0%,#F9FAFB 100%);
-                    height:100%;">
-            <div style="font-size:15px;font-weight:600;color:#1A202C;margin-bottom:10px;">
-                {title_emoji} {title_text}板块
-            </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;
-                        padding:8px 0;border-top:1px solid #F3F4F6;">
-                <span style="color:#6B7280;font-size:12.5px;">🚨 高风险项目总数</span>
-                <span style="color:{accent_color};font-size:18px;font-weight:700;">{total}</span>
-            </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;
-                        padding:8px 0;border-top:1px solid #F3F4F6;">
-                <span style="color:#6B7280;font-size:12.5px;">🏢 高风险蝶城项目</span>
-                <span style="color:{accent_color};font-size:18px;font-weight:700;">{n_city}</span>
-            </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;
-                        padding:8px 0;border-top:1px solid #F3F4F6;">
-                <span style="color:#6B7280;font-size:12.5px;">🏘️ 高风险街区住宅</span>
-                <span style="color:{accent_color};font-size:18px;font-weight:700;">{n_street}</span>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
+    card_html = (
+        '<div style="border:1px solid #E5E7EB;border-radius:12px;padding:14px 16px;'
+        'background:linear-gradient(135deg,#FFFFFF 0%,#F9FAFB 100%);height:100%;">'
+        '<div style="font-size:15px;font-weight:600;color:#1A202C;margin-bottom:10px;">'
+        f'{title_emoji} {title_text}板块'
+        '</div>'
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'padding:8px 0;border-top:1px solid #F3F4F6;">'
+        '<span style="color:#6B7280;font-size:12.5px;">🚨 高风险项目总数</span>'
+        f'<span style="color:{accent_color};font-size:18px;font-weight:700;">{total}</span>'
+        '</div>'
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'padding:8px 0;border-top:1px solid #F3F4F6;">'
+        '<span style="color:#6B7280;font-size:12.5px;">🏢 高风险蝶城项目</span>'
+        f'<span style="color:{accent_color};font-size:18px;font-weight:700;">{n_city}</span>'
+        '</div>'
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'padding:8px 0;border-top:1px solid #F3F4F6;">'
+        '<span style="color:#6B7280;font-size:12.5px;">🏘️ 高风险街区住宅</span>'
+        f'<span style="color:{accent_color};font-size:18px;font-weight:700;">{n_street}</span>'
+        '</div>'
+        '</div>'
+    )
+    st.markdown(card_html, unsafe_allow_html=True)
 
 
 st.subheader("📊 三大板块高风险指标")
