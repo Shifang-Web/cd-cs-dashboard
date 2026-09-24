@@ -50,7 +50,7 @@ def get_wecom_webhook_default():
 
 
 # ==========================================
-# 3. 侧边栏：企微推送设置 + 天气自动刷新设置
+# 3. 侧边栏：企微推送设置 + 天气自动刷新设置 + 告警音设置
 # ==========================================
 with st.sidebar:
     st.markdown("### ⚙️ 企业微信推送设置")
@@ -86,6 +86,11 @@ with st.sidebar:
         key="cfg_weather_refresh_min",
         help="建议 15 分钟：兼顾预警时效性与和风天气免费版每日调用配额",
     )
+
+    st.markdown("---")
+    # ---------- 告警音设置 ----------
+    st.markdown("### 🔊 告警音设置")
+
     ALERT_SOUND = st.checkbox(
         "新预警提示音", value=True,
         disabled=not WEATHER_AUTO_REFRESH, key="cfg_alert_sound",
@@ -94,6 +99,48 @@ with st.sidebar:
         "新预警弹窗告警", value=True,
         disabled=not WEATHER_AUTO_REFRESH, key="cfg_alert_popup",
     )
+
+    # 声音解锁组件（利用 localStorage 记住解锁状态，跨 iframe 共享）
+    sound_unlock_doc = """
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="margin:0; display:flex; justify-content:center; align-items:center; height:100%; background:transparent;">
+        <div id="sound-container" style="text-align:center;"></div>
+        <script>
+        (function() {
+            var container = document.getElementById('sound-container');
+            var unlocked = false;
+            try { unlocked = localStorage.getItem('alert_sound_unlocked') === 'true'; } catch(e) {}
+
+            if (unlocked) {
+                container.innerHTML = '<span style="color:#4B5563; font-size:12px;">✅ 告警音已启用</span>';
+            } else {
+                container.innerHTML = '<button id="unlock-btn" style="padding:6px 12px; background:#D0021B; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:12px;">🔊 点击启用告警音</button>';
+                document.getElementById('unlock-btn').addEventListener('click', function() {
+                    var AC = window.AudioContext || window.webkitAudioContext;
+                    if (!AC) return;
+                    var ctx = new AC();
+                    if (ctx.state === 'suspended') { ctx.resume(); }
+                    var o = ctx.createOscillator();
+                    var g = ctx.createGain();
+                    o.type = 'sine';
+                    o.frequency.value = 880;
+                    g.gain.setValueAtTime(0.001, ctx.currentTime);
+                    g.gain.exponentialRampToValueAtTime(0.3, ctx.currentTime + 0.02);
+                    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
+                    o.connect(g); g.connect(ctx.destination);
+                    o.start(); o.stop(ctx.currentTime + 0.22);
+                    try { localStorage.setItem('alert_sound_unlocked', 'true'); } catch(e) {}
+                    container.innerHTML = '<span style="color:#4B5563; font-size:12px;">✅ 告警音已启用</span>';
+                });
+            }
+        })();
+        </script>
+    </body>
+    </html>
+    """
+    components.html(sound_unlock_doc, height=40)
 
     if st.button("🔔 测试告警音", use_container_width=True,
                  disabled=not WEATHER_AUTO_REFRESH, key="btn_test_sound"):
@@ -491,43 +538,106 @@ def detect_new_alerts():
     return new_items
 
 
-def play_alert_sound(volume=0.35):
-    """注入 Web Audio 告警音（三短一长，类似警报器）。"""
-    doc = f"""
-    <script>
-    (function() {{
-      function beep() {{
-        try {{
-          var AC = window.AudioContext || window.webkitAudioContext;
-          if (!AC) return;
-          var ctx = new AC();
-          if (ctx.state === 'suspended') {{ try {{ ctx.resume(); }} catch(e) {{}} }}
-          var t0 = ctx.currentTime + 0.03;
-          var seq = [880, 660, 880, 660, 1100];
-          for (var i = 0; i < seq.length; i++) {{
-            (function(i) {{
-              var o = ctx.createOscillator();
-              var g = ctx.createGain();
-              o.type = 'square';
-              o.frequency.value = seq[i];
-              var st = t0 + i * 0.26;
-              g.gain.setValueAtTime(0.0001, st);
-              g.gain.exponentialRampToValueAtTime({volume}, st + 0.02);
-              g.gain.exponentialRampToValueAtTime(0.0001, st + 0.22);
-              o.connect(g); g.connect(ctx.destination);
-              o.start(st); o.stop(st + 0.24);
-            }})(i);
-          }}
-          setTimeout(function() {{ try {{ ctx.close(); }} catch(e) {{}} }}, 3000);
-        }} catch (e) {{}}
-      }}
-      if (document.readyState === 'complete') beep();
-      else window.addEventListener('load', beep);
-      setTimeout(beep, 250);
-    }})();
-    </script>
+def play_alert_sound(volume=0.35, force=False):
+    """播放告警音。
+    force=True：用于测试按钮，未解锁时显示可点击的播放按钮。
+    force=False：自动触发，仅在 localStorage 已解锁时自动播放。
     """
-    components.html(doc, height=0)
+    height = 40 if force else 0
+
+    doc = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="margin:0; display:flex; justify-content:center; align-items:center; height:100%; background:transparent;">
+        <div id="sound-container" style="text-align:center;"></div>
+        <script>
+        (function() {{
+            var seq = [880, 660, 880, 660, 1100];
+            var volume = {volume};
+            var force = {str(force).lower()};
+            var ctx = null;
+
+            function initAudio() {{
+                if (!ctx) {{
+                    var AC = window.AudioContext || window.webkitAudioContext;
+                    if (AC) {{ ctx = new AC(); }}
+                }}
+            }}
+
+            function playAudio() {{
+                return new Promise(function(resolve, reject) {{
+                    initAudio();
+                    if (!ctx) return reject('无AudioContext');
+                    
+                    function doPlay() {{
+                        try {{
+                            var t0 = ctx.currentTime + 0.03;
+                            for (var i = 0; i < seq.length; i++) {{
+                                (function(i) {{
+                                    var o = ctx.createOscillator();
+                                    var g = ctx.createGain();
+                                    o.type = 'square';
+                                    o.frequency.value = seq[i];
+                                    var st = t0 + i * 0.26;
+                                    g.gain.setValueAtTime(0.0001, st);
+                                    g.gain.exponentialRampToValueAtTime(volume, st + 0.02);
+                                    g.gain.exponentialRampToValueAtTime(0.0001, st + 0.22);
+                                    o.connect(g); g.connect(ctx.destination);
+                                    o.start(st); o.stop(st + 0.24);
+                                }})(i);
+                            }}
+                            resolve(true);
+                        }} catch(e) {{
+                            reject(e);
+                        }}
+                    }}
+
+                    if (ctx.state === 'suspended') {{
+                        ctx.resume().then(doPlay).catch(reject);
+                    }} else {{
+                        doPlay();
+                    }}
+                }});
+            }}
+
+            var container = document.getElementById('sound-container');
+            var unlocked = false;
+            try {{ unlocked = localStorage.getItem('alert_sound_unlocked') === 'true'; }} catch(e) {{}}
+
+            function showPlayButton() {{
+                container.innerHTML = '<button id="play-btn" style="padding:6px 12px; background:#D0021B; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:12px;">🔊 点击播放测试音</button>';
+                document.getElementById('play-btn').addEventListener('click', function() {{
+                    playAudio().then(function() {{
+                        try {{ localStorage.setItem('alert_sound_unlocked', 'true'); }} catch(e) {{}}
+                        container.innerHTML = '<span style="color:#4B5563; font-size:12px;">✅ 测试完成，告警音已解锁</span>';
+                    }}).catch(function() {{
+                        container.innerHTML = '<span style="color:#D0021B; font-size:12px;">❌ 浏览器阻止了声音</span>';
+                    }});
+                }});
+            }}
+
+            if (force) {{
+                // 测试模式：如果已解锁，尝试自动播放。如果失败（无用户手势），显示按钮
+                if (unlocked) {{
+                    playAudio().then(function() {{
+                        container.innerHTML = '<span style="color:#4B5563; font-size:12px;">✅ 正在播放告警音...</span>';
+                    }}).catch(function() {{
+                        showPlayButton(); // 自动播放被阻止，显示按钮让用户点击
+                    }});
+                }} else {{
+                    showPlayButton();
+                }}
+            }} else if (unlocked) {{
+                // 自动触发：静默尝试播放（如果被阻止则不报错，不显示按钮）
+                playAudio().catch(function() {{}});
+            }}
+        }})();
+        </script>
+    </body>
+    </html>
+    """
+    components.html(doc, height=height)
 
 
 def _alert_dialog_body(items, ts):
@@ -634,13 +744,13 @@ _new_alerts = detect_new_alerts()
 _force_sound = st.session_state.pop("_force_play_sound", False)
 
 if _force_sound and ALERT_SOUND:
-    play_alert_sound()
+    play_alert_sound(force=True)
 
 if _new_alerts:
     st.session_state["_weather_new_alerts"] = _new_alerts
     st.session_state["_weather_alert_ts"] = datetime.datetime.now()
     if ALERT_SOUND:
-        play_alert_sound()
+        play_alert_sound(force=False)  # 静默尝试，未解锁时自动跳过
     cities_str = "、".join(sorted({a["city"] for a in _new_alerts}))
     st.toast(f"🚨 检测到 {len(_new_alerts)} 条新天气预警：{cities_str}", icon="🚨")
 
@@ -966,7 +1076,7 @@ def _filter_by_view(df, view_type):
 
 
 # ==========================================
-# 15. 板块指标卡渲染函数（定义保留，渲染位置在第 17 节）
+# 15. 板块指标卡渲染函数
 # ==========================================
 def render_metric_card(title_emoji, title_text, total, n_city, n_street, accent_color="#D0021B"):
     card_html = (
